@@ -197,6 +197,6 @@ class JobStatusResponse(BaseModel):
     on_demand_image_requests: int = 0
     queues: Dict[str, int] = Field(default_factory=dict)
     leases: List[Dict[str, Any]] = Field(default_factory=list)
-    failed_details: List[Dict[str, str]] = Field(default_factory=list)
+    failed_details: List[Dict[str, Any]] = Field(default_factory=list)
     output_paths: List[str] = Field(default_factory=list)
     error: Optional[str] = None

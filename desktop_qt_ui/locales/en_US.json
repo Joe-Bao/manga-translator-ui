@@ -1583,7 +1583,7 @@
   "MCP Preview Quality Label": "Preview Quality (1-100)",
   "MCP Preview Quality Hint": "Compression quality for lossy WEBP / JPEG previews.",
   "MCP Inline Budget Label": "Batch Inline Budget (MB)",
-  "MCP Inline Budget Hint": "Maximum inline image payload per batch in Auto delivery mode (1-50 MB).",
+  "MCP Inline Budget Hint": "Maximum inline image payload per batch in Auto delivery mode (0.1-50 MB).",
   "MCP Max Parallel Batches Label": "Max Parallel Batches",
   "MCP Max Parallel Batches Hint": "Maximum leased batches held concurrently by the MCP client (1 recommended).",
   "MCP Lease Timeout Label": "Batch Lease Timeout (sec)",

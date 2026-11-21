@@ -66,6 +66,7 @@ class McpPagePanel(QWidget):
         self.log_service = get_log_service()
 
         self._syncing = False
+        self._cancelling_job = False
         self._log_entries: List[Dict[str, Any]] = []
         self._auto_scroll = True
 
@@ -597,6 +598,9 @@ class McpPagePanel(QWidget):
             self.mcp_service.models_unload_finished.connect(
                 self._on_models_unload_finished, type=Qt.ConnectionType.QueuedConnection
             )
+            self.mcp_service.job_cancel_finished.connect(
+                self._on_job_cancel_finished, type=Qt.ConnectionType.QueuedConnection
+            )
 
     # ------------------------------------------------------------------
     # Config synchronization & persistence
@@ -847,9 +851,18 @@ class McpPagePanel(QWidget):
             self._switch_page("settings")
 
     def _on_stop_job_clicked(self) -> None:
-        if self.mcp_service is not None:
-            self.mcp_service.cancel_active_job()
-            self.refresh_status()
+        if self.mcp_service is None:
+            return
+        self._cancelling_job = True
+        self.stop_job_button.setEnabled(False)
+        self.mcp_service.cancel_active_job_async()
+
+    @pyqtSlot(bool, str)
+    def _on_job_cancel_finished(self, ok: bool, error: str) -> None:
+        self._cancelling_job = False
+        self.refresh_status()
+        if not ok:
+            self._show_toast(self._t("Error"), error or self._t("Error"), error=True)
 
     def _on_unload_models_clicked(self) -> None:
         if self.mcp_service is None:
@@ -955,7 +968,7 @@ class McpPagePanel(QWidget):
                 failed=failed,
             )
         )
-        self.stop_job_button.setEnabled(status == "running")
+        self.stop_job_button.setEnabled(status == "running" and not self._cancelling_job)
 
     def refresh_status(self) -> None:
         self.sync_from_config()
@@ -1119,6 +1132,7 @@ class McpPagePanel(QWidget):
             (self.mcp_service.log_record_received, self._on_log_record_received),
             (self.mcp_service.api_conflicts_changed, self._on_api_conflicts_changed),
             (self.mcp_service.models_unload_finished, self._on_models_unload_finished),
+            (self.mcp_service.job_cancel_finished, self._on_job_cancel_finished),
         ):
             try:
                 sig.disconnect(slot)

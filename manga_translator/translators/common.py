@@ -2125,7 +2125,7 @@ class CommonTranslator(InfererModule):
             if region_count >= 2:
                 needs_check_count += 1
                 # 检查是否包含BR标记
-                has_br = bool(re.search(r'(\[BR\]|【BR】|<br>)', translation, flags=re.IGNORECASE))
+                has_br = bool(re.search(r'(\[BR\]|【BR】|<br\s*/?>)', translation, flags=re.IGNORECASE))
                 if not has_br:
                     missing_br_count += 1
                     missing_indices.append(idx + 1)

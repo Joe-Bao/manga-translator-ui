@@ -260,6 +260,7 @@ class McpService(QObject):
     log_record_received = pyqtSignal(dict)
     api_conflicts_changed = pyqtSignal(list)
     models_unload_finished = pyqtSignal(bool, str)
+    job_cancel_finished = pyqtSignal(bool, str)
 
     def __init__(
         self,
@@ -374,8 +375,7 @@ class McpService(QObject):
         if self._shutdown_done:
             return
         try:
-            active_id = self.job_manager._active_job_id
-            if not self.has_active_job() or active_id == summary.get("job_id"):
+            if self.job_manager.should_update_ui_for_job(summary.get("job_id")):
                 self.job_progress_changed.emit(summary)
             self.job_finished.emit(summary)
         except RuntimeError:
@@ -446,6 +446,33 @@ class McpService(QObject):
         if not self.has_active_job():
             return None
         return self.job_manager.cancel_job()
+
+    def cancel_active_job_async(
+        self,
+        on_done: Optional[Callable[[Optional[Dict[str, Any]]], None]] = None,
+        on_error: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        def _worker() -> None:
+            try:
+                result = self.cancel_active_job()
+                if not self._shutdown_done:
+                    try:
+                        self.job_cancel_finished.emit(True, "")
+                    except RuntimeError:
+                        pass
+                if callable(on_done):
+                    on_done(result)
+            except Exception as exc:
+                err = str(exc)
+                if not self._shutdown_done:
+                    try:
+                        self.job_cancel_finished.emit(False, err)
+                    except RuntimeError:
+                        pass
+                if callable(on_error):
+                    on_error(err)
+
+        threading.Thread(target=_worker, name="mcp-cancel-job", daemon=True).start()
 
     def unload_models_async(
         self,

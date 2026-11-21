@@ -1582,7 +1582,7 @@
   "MCP Preview Quality Label": "预览图质量 (1-100)",
   "MCP Preview Quality Hint": "应用于 WEBP / JPEG 有损压缩格式。",
   "MCP Inline Budget Label": "单批内联预算 (MB)",
-  "MCP Inline Budget Hint": "自动投递模式下，单个批次内联图片体积上限（1-50 MB）。",
+  "MCP Inline Budget Hint": "自动投递模式下，单个批次内联图片体积上限（0.1-50 MB）。",
   "MCP Max Parallel Batches Label": "最大并发翻译批次数",
   "MCP Max Parallel Batches Hint": "允许 MCP 客户端同时领用的批次数（推荐 1；每批领用租约超时前保持锁定）。",
   "MCP Lease Timeout Label": "批次领用超时 (秒)",

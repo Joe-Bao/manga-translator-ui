@@ -27,6 +27,8 @@ logger = logging.getLogger("manga_translator.mcp")
 
 # Serializes glossary read-merge-write across parallel MCP batch submissions.
 _GLOSSARY_MERGE_LOCK = threading.Lock()
+# Serializes translator overlay handoff across GpuPriorityWorker and RenderWorker.
+_OVERLAY_STATE_LOCK = threading.Lock()
 
 _API_CONFLICT_SPECS = (
     ("ocr", "ocr", "OCR"),
@@ -300,9 +302,16 @@ async def preprocess_page(
         ctx._initial_region_ids = {id(r) for r in (ctx.text_regions or [])}
         return ctx
 
-    loaded_regions, loaded_mask, mask_is_refined, _skip_scale, _skip_rep, parse_failures = (
-        translator._load_text_and_regions_from_file(image_path, config)
-    )
+    with _OVERLAY_STATE_LOCK:
+        loaded_regions, loaded_mask, mask_is_refined, _skip_scale, _skip_rep, parse_failures = (
+            translator._load_text_and_regions_from_file(image_path, config)
+        )
+        loaded_render_overlays = getattr(translator, "_loaded_render_overlays", None)
+        pending_paste_overlays = getattr(translator, "_pending_paste_overlays", None)
+        if hasattr(translator, "_loaded_render_overlays"):
+            translator._loaded_render_overlays = None
+        if hasattr(translator, "_pending_paste_overlays"):
+            translator._pending_paste_overlays = None
     if loaded_regions is None:
         raise FileNotFoundError(f"Existing translation JSON not found for: {image_path}")
 
@@ -330,6 +339,8 @@ async def preprocess_page(
     ctx.save_lossless = getattr(translator, "save_lossless", True)
     ctx.compression_effort = getattr(translator, "compression_effort", 100)
     ctx.load_text_parse_failures = parse_failures
+    ctx._mcp_loaded_render_overlays = loaded_render_overlays
+    ctx._mcp_pending_paste_overlays = pending_paste_overlays
 
     translator._set_image_context(config, orig_image)
     image_md5 = get_image_md5(orig_image)
@@ -337,19 +348,6 @@ async def preprocess_page(
 
     ctx.img_rgb, ctx.img_alpha = load_image(ctx.upscaled)
     ctx.bubble_mask = None
-
-    if loaded_mask is not None:
-        mask_arr = np.asarray(loaded_mask)
-        if mask_arr.ndim == 3:
-            mask_arr = mask_arr[:, :, 0]
-        target_h, target_w = ctx.img_rgb.shape[:2]
-        if mask_arr.shape[:2] != (target_h, target_w):
-            mask_arr = cv2.resize(mask_arr, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
-        mask_arr = mask_arr.astype(np.uint8, copy=False)
-        if mask_is_refined:
-            ctx.mask = mask_arr
-        else:
-            ctx.mask_raw = mask_arr
 
     translator._prepare_loaded_regions(loaded_regions, use_text_as_translation=False)
     for region in loaded_regions:
@@ -362,6 +360,55 @@ async def preprocess_page(
     ctx.text_regions = loaded_regions
     ctx.skip_font_scaling = bool(_skip_scale)
     translator._apply_pre_dictionary_to_regions(ctx)
+
+    target_h, target_w = ctx.img_rgb.shape[:2]
+    if loaded_mask is not None:
+        mask_arr = np.asarray(loaded_mask)
+        if mask_arr.ndim == 3:
+            mask_arr = mask_arr[:, :, 0]
+        elif mask_arr.ndim != 2:
+            squeezed = np.squeeze(mask_arr)
+            if squeezed.ndim == 2:
+                mask_arr = squeezed
+            else:
+                logger.warning(
+                    f"[retranslate_json] Invalid loaded mask shape {mask_arr.shape}; falling back to zero mask"
+                )
+                mask_arr = np.zeros((target_h, target_w), dtype=np.uint8)
+        if mask_arr.shape[:2] != (target_h, target_w):
+            mask_arr = cv2.resize(mask_arr, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        if mask_arr.dtype != np.uint8:
+            mask_arr = mask_arr.astype(np.uint8, copy=False)
+        if mask_is_refined:
+            ctx.mask = mask_arr
+            ctx.mask_raw = mask_arr.copy()
+        else:
+            ctx.mask_raw = mask_arr
+    else:
+        mask = np.zeros((target_h, target_w), dtype=np.uint8)
+        polygons = []
+        for r in ctx.text_regions:
+            lines_val = getattr(r, "lines", None)
+            if lines_val is None:
+                continue
+            for p in lines_val:
+                arr_p = np.asarray(p)
+                if arr_p.size >= 6:
+                    polygons.append(np.asarray(arr_p, dtype=np.int32).reshape((-1, 1, 2)))
+        if polygons:
+            cv2.fillPoly(mask, polygons, 255)
+        ctx.mask_raw = mask
+
+    needs_bubble_cache = (
+        bool(getattr(config.ocr, "limit_mask_dilation_to_bubble_mask", False))
+        or bool(getattr(config.ocr, "use_model_bubble_repair_intersection", False))
+        or getattr(config.render, "layout_mode", None) == "balloon_fill"
+        or bool(getattr(config.render, "center_text_in_bubble", False))
+        or bool(getattr(config.inpainter, "solid_fill_pure_bubbles", False))
+    )
+    if needs_bubble_cache and hasattr(translator, "_prime_bubble_detection_cache"):
+        translator._prime_bubble_detection_cache(config, ctx)
+
     ctx._initial_region_ids = {id(r) for r in loaded_regions}
     return ctx
 
@@ -732,24 +779,38 @@ async def validate_batch_translations(
     )
     cleaned_map = {rid: trans for rid, trans in zip(expected_ids, ordered_translations)}
 
+    max_br_retries = max(1, int(getattr(config.translator, "post_check_max_retry_attempts", 3) or 3))
     if not br_ok:
-        for rid, region, _page in expected_items:
-            raw_lines = getattr(region, "lines", None)
-            region_count = max(int(len(raw_lines)), 1) if raw_lines is not None else 1
-            trans_val = cleaned_map[rid]
-            if region_count >= 2 and not re.search(r"(\[BR\]|【BR】|<br\s*/?>)", trans_val, flags=re.IGNORECASE):
+        if retry_count < max_br_retries:
+            for rid, region, _page in expected_items:
+                raw_lines = getattr(region, "lines", None)
+                region_count = max(int(len(raw_lines)), 1) if raw_lines is not None else 1
+                trans_val = cleaned_map[rid]
+                if region_count >= 2 and not re.search(r"(\[BR\]|【BR】|<br\s*/?>)", trans_val, flags=re.IGNORECASE):
+                    errors.append(
+                        ValidationErrorItem(
+                            id=rid,
+                            reason="missing_br_marker",
+                            original_region_count=region_count,
+                            detail=(
+                                f"id={rid} has original_region_count={region_count} (>=2) and "
+                                "requires explicit [BR] line break marker(s)."
+                            ),
+                        )
+                    )
+            if not errors:
                 errors.append(
                     ValidationErrorItem(
-                        id=rid,
+                        id=None,
                         reason="missing_br_marker",
-                        original_region_count=region_count,
-                        detail=(
-                            f"id={rid} has original_region_count={region_count} (>=2) and "
-                            "requires explicit [BR] line break marker(s)."
-                        ),
+                        detail="Batch failed [BR] marker validation; ensure multi-line bubbles include [BR].",
                     )
                 )
-        return False, errors, cleaned_map
+            return False, errors, cleaned_map
+        logger.warning(
+            f"[MCP] [BR] marker check failed after {retry_count} retry attempt(s) "
+            f"(limit={max_br_retries}); accepting batch to prevent an infinite retry loop."
+        )
 
     # Optional post-translation quality checks (gated by retry budget so a batch can't loop forever)
     enable_post_check = bool(getattr(config.translator, "enable_post_translation_check", False))
@@ -800,6 +861,7 @@ async def apply_batch_post_processing(
     *,
     new_terms: Optional[List[Dict[str, Any]]] = None,
     prompt_file_path: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Tuple[List[int], bool]:
     """Apply validated translations, run post-processing/filtering, and merge glossary."""
     from manga_translator.translators.common import merge_glossary_to_file
@@ -811,6 +873,8 @@ async def apply_batch_post_processing(
 
     redo_pages: List[int] = []
     for page in pages_in_batch:
+        if cancel_event is not None and cancel_event.is_set():
+            break
         if getattr(page, "failed", False):
             continue
         ctx = page.ctx
@@ -843,12 +907,14 @@ async def apply_batch_post_processing(
 
     glossary_modified = False
     if (
-        new_terms
+        (cancel_event is None or not cancel_event.is_set())
+        and new_terms
         and bool(getattr(config.translator, "extract_glossary", False))
         and prompt_file_path
     ):
         with _GLOSSARY_MERGE_LOCK:
-            glossary_modified = bool(merge_glossary_to_file(prompt_file_path, new_terms))
+            if cancel_event is None or not cancel_event.is_set():
+                glossary_modified = bool(merge_glossary_to_file(prompt_file_path, new_terms))
 
     return redo_pages, glossary_modified
 
@@ -927,8 +993,31 @@ async def render_and_save_page(
     ):
         inpainted_snapshot = np.copy(ctx.img_inpainted)
 
+    loaded_overlays = getattr(ctx, "_mcp_loaded_render_overlays", None)
+    pending_paste = getattr(ctx, "_mcp_pending_paste_overlays", None)
+    has_overlays = bool(loaded_overlays or pending_paste)
+    if has_overlays and hasattr(translator, "_compose_render_overlays_on_inpainted"):
+        with _OVERLAY_STATE_LOCK:
+            translator._loaded_render_overlays = loaded_overlays
+            translator._pending_paste_overlays = pending_paste
+            try:
+                translator._compose_render_overlays_on_inpainted(ctx)
+            finally:
+                translator._loaded_render_overlays = None
+                translator._pending_paste_overlays = None
+    ctx._mcp_loaded_render_overlays = None
+    ctx._mcp_pending_paste_overlays = None
+
     if not getattr(ctx, "text_regions", None):
-        ctx.result = dump_image(ctx.input, ctx.img_rgb, getattr(ctx, "img_alpha", None))
+        if has_overlays:
+            if getattr(ctx, "img_inpainted", None) is not None:
+                ctx.result = dump_image(ctx.input, ctx.img_inpainted, getattr(ctx, "img_alpha", None))
+            elif getattr(ctx, "upscaled", None) is not None and hasattr(ctx.upscaled, "copy"):
+                ctx.result = ctx.upscaled.copy()
+            else:
+                ctx.result = dump_image(ctx.input, ctx.img_rgb, getattr(ctx, "img_alpha", None))
+        else:
+            ctx.result = dump_image(ctx.input, ctx.img_rgb, getattr(ctx, "img_alpha", None))
     else:
         ctx.img_rendered = await translator._run_text_rendering(config, ctx)
         ctx.result = dump_image(

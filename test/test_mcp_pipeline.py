@@ -1745,3 +1745,575 @@ def test_retranslate_json_applies_pre_dict_and_protects_corrupt_regions_on_save(
     assert json_path.read_text(encoding="utf-8") == original_json_text
 
 
+def _encode_png_b64(arr: np.ndarray) -> str:
+    import base64
+    import cv2
+
+    ok, buf = cv2.imencode(".png", arr)
+    assert ok
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+def test_retranslate_json_real_mask_refinement_and_overlays(tmp_path):
+    """R4-1: retranslate_json works with real dispatch_mask_refinement (no mask & refined pending_redo) + overlays."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Subcase A: JSON without mask_raw + paint_overlay isolation across pages
+    p1 = _make_png(tmp_path / "p1.png", size=(240, 320), color=(245, 245, 245))
+    p2 = _make_png(tmp_path / "p2.png", size=(240, 320), color=(245, 245, 245))
+
+    paint_bgra = np.zeros((320, 240, 4), dtype=np.uint8)
+    paint_bgra[10:30, 10:30] = [0, 0, 255, 255]  # BGRA -> red (255, 0, 0) in RGB
+
+    Path(get_json_path(p1, create_dir=True)).write_text(
+        json.dumps(
+            {
+                os.path.abspath(p1): {
+                    "regions": [
+                        {
+                            "lines": [[[40, 80], [140, 80], [140, 120], [40, 120]]],
+                            "texts": ["原文1"],
+                            "text": "原文1",
+                            "translation": "旧1",
+                            "prob": 0.9,
+                        }
+                    ],
+                    "paint_overlay": _encode_png_b64(paint_bgra),
+                    "original_width": 240,
+                    "original_height": 320,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    Path(get_json_path(p2, create_dir=True)).write_text(
+        json.dumps(
+            {
+                os.path.abspath(p2): {
+                    "regions": [
+                        {
+                            "lines": [[[40, 80], [140, 80], [140, 120], [40, 120]]],
+                            "texts": ["原文2"],
+                            "text": "原文2",
+                            "translation": "旧2",
+                            "prob": 0.9,
+                        }
+                    ],
+                    "original_width": 240,
+                    "original_height": 320,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    inpaint_masks = []
+
+    def real_mask_factory(params):
+        translator = MangaTranslator(params=params)
+        translator._mcp_context_enabled = True
+        translator._models_loaded = True
+        translator.start_model_cleanup_job = False
+
+        async def _inpaint(config, ctx):
+            fname = os.path.basename(getattr(ctx, "image_name", "") or "")
+            assert ctx.mask is not None
+            assert ctx.mask.ndim == 2 and ctx.mask.dtype == np.uint8
+            inpaint_masks.append((fname, ctx.mask.copy()))
+            return ctx.img_rgb.copy()
+
+        async def _render(config, ctx):
+            return ctx.img_inpainted.copy()
+
+        # Do NOT mock _run_mask_refinement so real dispatch_mask_refinement executes.
+        translator._run_inpainting = _inpaint
+        translator._run_text_rendering = _render
+        return translator
+
+    cfg = _base_config(str(out_dir))
+    cfg["cli"]["batch_size"] = 2
+    cfg["cli"]["save_text"] = True
+    mgr = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg, translator_factory=real_mask_factory)
+    try:
+        job = mgr.create_translation_job(inputs=[p1, p2], output_dir=str(out_dir), retranslate_json=True)
+        batch, _ = mgr.next_translation_batch(job.job_id)
+        sub, _ = mgr.submit_translation_batch(
+            job.job_id,
+            batch.batch_id,
+            [{"id": 1, "translation": "新1"}, {"id": 2, "translation": "新2"}],
+            return_next=True,
+        )
+        assert sub.done is True
+        assert sub.summary["failed_pages"] == 0
+        assert len(inpaint_masks) == 2
+        assert all(np.any(mask) for _fn, mask in inpaint_masks)
+
+        out1 = np.array(Image.open(out_dir / "p1.png").convert("RGB"))
+        out2 = np.array(Image.open(out_dir / "p2.png").convert("RGB"))
+        inp1 = np.array(Image.open(get_inpainted_path(p1, create_dir=False)).convert("RGB"))
+        assert tuple(out1[20, 20]) == (255, 0, 0)
+        assert tuple(inp1[20, 20]) == (245, 245, 245)  # overlay not baked into inpainted sidecar
+        assert tuple(out2[20, 20]) == (245, 245, 245)  # overlay did not leak to p2
+    finally:
+        mgr.shutdown()
+
+    # Subcase B: mask_is_refined=True + pending_redo runs real dispatch_mask_refinement without crash
+    inpaint_masks.clear()
+    p3 = _make_png(tmp_path / "p3.png", size=(240, 320), color=(245, 245, 245))
+    refined_mask = np.zeros((320, 240), dtype=np.uint8)
+    refined_mask[20:44, 20:100] = 255
+    refined_mask[140:164, 20:100] = 255
+
+    Path(get_json_path(p3, create_dir=True)).write_text(
+        json.dumps(
+            {
+                os.path.abspath(p3): {
+                    "regions": [
+                        {
+                            "lines": [[[20, 20], [100, 20], [100, 44], [20, 44]]],
+                            "texts": ["保留词"],
+                            "text": "保留词",
+                            "translation": "旧保留",
+                            "prob": 0.9,
+                        },
+                        {
+                            "lines": [[[20, 140], [100, 140], [100, 164], [20, 164]]],
+                            "texts": ["消す言葉"],
+                            "text": "消す言葉",
+                            "translation": "旧过滤",
+                            "prob": 0.9,
+                        },
+                    ],
+                    "mask_raw": _encode_png_b64(refined_mask),
+                    "mask_is_refined": True,
+                    "original_width": 240,
+                    "original_height": 320,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    mgr2 = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg, translator_factory=real_mask_factory)
+    try:
+        job2 = mgr2.create_translation_job(inputs=[p3], output_dir=str(out_dir), retranslate_json=True)
+        b3, _ = mgr2.next_translation_batch(job2.job_id)
+        sub3, _ = mgr2.submit_translation_batch(
+            job2.job_id,
+            b3.batch_id,
+            [
+                {"id": 1, "translation": "新保留"},
+                {"id": 2, "translation": "消す言葉"},  # filtered out -> pending_redo
+            ],
+            return_next=True,
+        )
+        assert sub3.redo_pages == [0]
+        assert sub3.done is True
+        assert sub3.summary["failed_pages"] == 0
+        assert len(inpaint_masks) >= 1
+        final_mask = inpaint_masks[-1][1]
+        assert final_mask[32, 60] > 0
+        assert final_mask[152, 60] == 0
+    finally:
+        mgr2.shutdown()
+
+
+def test_br_validation_accepts_self_closing_br_and_caps_retries(tmp_path):
+    """R4-2: <br/> and <br /> pass [BR] check, retry_needed never returns empty errors, and retries cap."""
+    out_dir = tmp_path / "out"
+    img_path = _make_png(tmp_path / "p1.png")
+    regions_map = {
+        "p1.png": [
+            _make_block("一行", num_lines=1, y=20),
+            _make_block("二行A", num_lines=2, y=60),
+            _make_block("二行B", num_lines=2, y=130),
+        ]
+    }
+    factory, _calls = _make_stub_factory(regions_map)
+
+    cfg = _base_config(str(out_dir))
+    cfg["render"]["disable_auto_wrap"] = True
+    cfg["render"]["check_br_and_retry"] = True
+    cfg["translator"]["post_check_max_retry_attempts"] = 2
+
+    # 1) <br/> / <br /> pass directly and single-region extra <br/> is stripped
+    mgr = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg, translator_factory=factory)
+    try:
+        job = mgr.create_translation_job(inputs=[img_path], output_dir=str(out_dir))
+        batch, _ = mgr.next_translation_batch(job.job_id)
+        sub, _ = mgr.submit_translation_batch(
+            job.job_id,
+            batch.batch_id,
+            [
+                {"id": 1, "translation": "第一<br/>句"},
+                {"id": 2, "translation": "第二<br/>行"},
+                {"id": 3, "translation": "第三<br />行"},
+            ],
+            return_next=True,
+        )
+        assert sub.status == "accepted"
+        assert sub.done is True
+        saved = json.loads(Path(get_json_path(img_path, create_dir=False)).read_text(encoding="utf-8"))
+        saved_regions = next(iter(saved.values()))["regions"]
+        assert saved_regions[0]["translation"] == "第一句"
+    finally:
+        mgr.shutdown()
+
+    # 2) Missing [BR] retries up to max_br_retries (2), never with errors=[], then accepts on attempt 3
+    mgr2 = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg, translator_factory=factory)
+    try:
+        job2 = mgr2.create_translation_job(inputs=[img_path], output_dir=str(out_dir))
+        batch2, _ = mgr2.next_translation_batch(job2.job_id)
+        payload = [
+            {"id": 1, "translation": "单行[BR]清理"},
+            {"id": 2, "translation": "缺断句A"},
+            {"id": 3, "translation": "缺断句B"},
+        ]
+        r1, _ = mgr2.submit_translation_batch(job2.job_id, batch2.batch_id, payload, return_next=True)
+        assert r1.status == "retry_needed"
+        assert len(r1.errors) > 0
+
+        r2, _ = mgr2.submit_translation_batch(job2.job_id, batch2.batch_id, payload, return_next=True)
+        assert r2.status == "retry_needed"
+        assert len(r2.errors) > 0
+
+        r3, _ = mgr2.submit_translation_batch(job2.job_id, batch2.batch_id, payload, return_next=True)
+        assert r3.status == "accepted"
+        assert r3.done is True
+        saved2 = json.loads(Path(get_json_path(img_path, create_dir=False)).read_text(encoding="utf-8"))
+        assert next(iter(saved2.values()))["regions"][0]["translation"] == "单行清理"
+    finally:
+        mgr2.shutdown()
+
+
+def test_submit_cancel_release_preview_concurrency_guards(tmp_path, monkeypatch):
+    """R4-3: release_batch blocks submitting, cancel aborts commit/glossary, preview dirs clean up, committed blocks preview."""
+    import threading
+    import manga_translator.mcp.job_manager as job_manager_module
+
+    out_dir = tmp_path / "out"
+    p1 = _make_png(tmp_path / "p1.png")
+    prompt_file = tmp_path / "prompt.yaml"
+    prompt_file.write_text(
+        yaml.safe_dump({"system_prompt": "Translate", "glossary": {}}, allow_unicode=True),
+        encoding="utf-8",
+    )
+
+    cfg = _base_config(str(out_dir))
+    cfg["translator"]["extract_glossary"] = True
+    cfg["translator"]["high_quality_prompt_path"] = str(prompt_file)
+    factory, _ = _make_stub_factory({"p1.png": [_make_block("并发取消")]})
+
+    entered_post = threading.Event()
+    allow_post = threading.Event()
+    orig_post = job_manager_module.apply_batch_post_processing
+
+    async def _slow_post(*args, **kwargs):
+        entered_post.set()
+        allow_post.wait(timeout=5.0)
+        return await orig_post(*args, **kwargs)
+
+    monkeypatch.setattr(job_manager_module, "apply_batch_post_processing", _slow_post)
+
+    mgr = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg, translator_factory=factory)
+    try:
+        job = mgr.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        internal_job = mgr._jobs[job.job_id]
+        batch, _ = mgr.next_translation_batch(job.job_id)
+
+        submit_holder = {}
+
+        def _submit():
+            resp, _imgs = mgr.submit_translation_batch(
+                job.job_id,
+                batch.batch_id,
+                [{"id": 1, "translation": "译文"}],
+                new_terms=[
+                    {
+                        "category": "Item",
+                        "original": "CancelTerm",
+                        "aliases": [{"original": "CancelTerm", "translations": [{"text": "取消词"}]}],
+                    }
+                ],
+                return_next=False,
+            )
+            submit_holder["resp"] = resp
+
+        t_sub = threading.Thread(target=_submit, daemon=True)
+        t_sub.start()
+        assert entered_post.wait(timeout=5.0)
+
+        rel = mgr.release_batch(job.job_id, batch.batch_id)
+        assert rel["released"] is False
+        assert "currently being submitted" in rel["message"]
+
+        cancel_holder = {}
+        t_cancel = threading.Thread(
+            target=lambda: cancel_holder.setdefault("status", mgr.cancel_job(job.job_id)),
+            daemon=True,
+        )
+        t_cancel.start()
+        time.sleep(0.1)
+        allow_post.set()
+
+        t_sub.join(timeout=5.0)
+        t_cancel.join(timeout=5.0)
+        assert not t_sub.is_alive() and not t_cancel.is_alive()
+        assert submit_holder["resp"].status == "error"
+        assert submit_holder["resp"].done is True
+        assert internal_job.pages[0].committed is False
+        parsed_prompt = yaml.safe_load(prompt_file.read_text(encoding="utf-8"))
+        assert parsed_prompt["glossary"] == {}
+    finally:
+        allow_post.set()
+        monkeypatch.setattr(job_manager_module, "apply_batch_post_processing", orig_post)
+        mgr.shutdown()
+
+    # Check committed page blocks get_page_preview and file_path preview dir is cleaned up if cancelled mid-delivery
+    cfg2 = _base_config(str(out_dir), image_delivery="file_path")
+    orig_delivery = job_manager_module.resolve_batch_image_delivery
+    delivery_written = threading.Event()
+    allow_delivery_return = threading.Event()
+
+    def _wrapped_delivery(*args, **kwargs):
+        res = orig_delivery(*args, **kwargs)
+        delivery_written.set()
+        allow_delivery_return.wait(timeout=5.0)
+        return res
+
+    mgr2 = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg2, translator_factory=factory)
+    try:
+        # First check committed page rejection cleanly
+        job_c = mgr2.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        internal_c = mgr2._jobs[job_c.job_id]
+        mgr2.next_translation_batch(job_c.job_id)
+        with internal_c._cond:
+            internal_c.pages[0].committed = True
+        with pytest.raises(RuntimeError, match="committed/rendered"):
+            mgr2.get_page_preview(job_c.job_id, 0)
+        with internal_c._cond:
+            internal_c.pages[0].committed = False
+        mgr2.cancel_job(job_c.job_id)
+
+        # Now cancel mid-next_translation_batch after preview file is written
+        monkeypatch.setattr(job_manager_module, "resolve_batch_image_delivery", _wrapped_delivery)
+        job_d = mgr2.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        preview_dir = out_dir / "manga_translator_work" / "mcp_preview" / job_d.job_id
+        next_holder = {}
+
+        def _next():
+            next_holder["res"] = mgr2.next_translation_batch(job_d.job_id)
+
+        t_next = threading.Thread(target=_next, daemon=True)
+        t_next.start()
+        assert delivery_written.wait(timeout=5.0)
+        assert preview_dir.exists()
+        mgr2.cancel_job(job_d.job_id)
+        allow_delivery_return.set()
+        t_next.join(timeout=5.0)
+
+        payload_d, imgs_d = next_holder["res"]
+        assert payload_d.done is True
+        assert payload_d.summary["status"] == "cancelled"
+        assert imgs_d == []
+        assert not preview_dir.exists()
+    finally:
+        allow_delivery_return.set()
+        mgr2.shutdown()
+
+
+def test_delayed_finish_cancel_idle_dedup_and_all_skipped_ui_progress(tmp_path, monkeypatch):
+    """R4-4 & R3-4: delayed finish won't disturb new job, cancel_job dedups idle unload, 0-pending emits UI progress."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p1 = _make_png(tmp_path / "p1.png")
+    factory, _ = _make_stub_factory({"p1.png": [_make_block("测试")]})
+
+    # 1) cancel_job with models_idle_ttl=0 + unload_models_after_translation=True unloads at most once
+    cfg = _base_config(str(out_dir), models_idle_ttl=0)
+    cfg["app"]["unload_models_after_translation"] = True
+    mgr = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg, translator_factory=factory)
+    unload_calls = []
+    monkeypatch.setattr(mgr, "unload_models", lambda: unload_calls.append(1) or {"ok": True})
+    try:
+        j1 = mgr.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        mgr.next_translation_batch(j1.job_id)
+        mgr.cancel_job(j1.job_id)
+        time.sleep(0.25)
+        assert len(unload_calls) == 1
+
+        # 2) Delayed _handle_job_finished from old job while a newer job is active must not clobber or unload
+        j2 = mgr.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        old_fake_job = SimpleNamespace(
+            job_id=j1.job_id,
+            pages=[1],
+            completed_output_sources={},
+            get_status_dict=lambda: {"job_id": j1.job_id, "status": "cancelled"},
+        )
+        assert mgr.should_update_ui_for_job(j1.job_id) is False
+        assert mgr.should_update_ui_for_job(j2.job_id) is True
+        mgr._handle_job_finished(old_fake_job)
+        time.sleep(0.15)
+        assert mgr._active_job_id == j2.job_id
+        assert len(unload_calls) == 1  # untouched
+        mgr.cancel_job(j2.job_id)
+    finally:
+        mgr.shutdown()
+
+    # 3) All-skipped (pending_pages == 0) via McpService emits job_progress_changed and job_finished
+    _make_png(out_dir / "p1.png")
+    cfg_skip = _base_config(str(out_dir))
+    cfg_skip["cli"]["overwrite"] = False
+    svc = McpService(root_dir=str(_bootstrap.ROOT), config_service=SimpleNamespace(get_config=lambda: cfg_skip))
+    svc.job_manager._translator_factory = factory
+    progress_events = []
+    finished_events = []
+    svc.job_progress_changed.connect(lambda d: progress_events.append(d))
+    svc.job_finished.connect(lambda d: finished_events.append(d))
+    try:
+        job_skip = svc.job_manager.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        assert job_skip.pending_pages == 0
+        assert job_skip.skipped_pages == 1
+        assert len(progress_events) == 1
+        assert progress_events[0]["job_id"] == job_skip.job_id
+        assert progress_events[0]["skipped_pages"] == 1
+        assert len(finished_events) == 1
+        assert finished_events[0]["job_id"] == job_skip.job_id
+    finally:
+        svc.shutdown()
+
+
+def test_archive_release_fallback_render_batch_status_and_edge_fixes(tmp_path, monkeypatch):
+    """R4-5, R4-6, R4-7: archived release_batch/preview fallback, render FAILED status + int page_index, output_dir & archive cleanup, async cancel."""
+    import threading
+    import manga_translator.mcp.job_manager as job_manager_module
+    import manga_translator.utils.text_filter as text_filter_module
+    import desktop_qt_ui.utils.archive_extractor as archive_extractor_module
+
+    out_dir = tmp_path / "explicit_out"
+    p1 = _make_png(tmp_path / "p1.png")
+    factory, _ = _make_stub_factory({"p1.png": [_make_block("边界测试")]})
+
+    # 1) Explicit output_dir overrides cli.save_to_source_dir=True & filter_list refresh
+    filter_reloads = []
+    monkeypatch.setattr(
+        text_filter_module,
+        "load_filter_list",
+        lambda force_reload=False: filter_reloads.append(force_reload) or ([], []),
+    )
+    cfg = _base_config(str(out_dir))
+    cfg["cli"]["save_to_source_dir"] = True
+    cfg["filter_text_enabled"] = True
+
+    mgr = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg, translator_factory=factory)
+    try:
+        job = mgr.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        internal = mgr._jobs[job.job_id]
+        assert internal.save_info["save_to_source_dir"] is False
+        assert filter_reloads == [True]
+        b1, _ = mgr.next_translation_batch(job.job_id)
+        sub, _ = mgr.submit_translation_batch(
+            job.job_id, b1.batch_id, [{"id": 1, "translation": "输出测试"}], return_next=True
+        )
+        assert sub.done is True
+        assert (out_dir / "p1.png").exists()
+        assert not (tmp_path / "manga_translator_work" / "result" / "p1.png").exists()
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and job.job_id in mgr._jobs:
+            time.sleep(0.02)
+
+        # R4-5: archived release_batch returns released=False (no KeyError), get_page_preview raises RuntimeError
+        rel = mgr.release_batch(job.job_id, b1.batch_id)
+        assert rel["released"] is False
+        assert rel["status"] == "completed"
+        with pytest.raises(RuntimeError, match="released"):
+            mgr.get_page_preview(job.job_id, 0)
+    finally:
+        mgr.shutdown()
+
+    # 2) Render returning success=False sets batch.status="FAILED", page.ctx=None, failed_details[].page_index as int
+    async def _fail_render(*_args, **_kwargs):
+        return {
+            "image_name": p1,
+            "output_path": None,
+            "success": False,
+            "skipped": False,
+            "skip_reason": None,
+            "error": "simulated render failure",
+        }
+
+    monkeypatch.setattr(job_manager_module, "render_and_save_page", _fail_render)
+    cfg_fail = _base_config(str(out_dir))
+    mgr_fail = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg_fail, translator_factory=factory)
+    try:
+        job_f = mgr_fail.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        internal_f = mgr_fail._jobs[job_f.job_id]
+        bf, _ = mgr_fail.next_translation_batch(job_f.job_id)
+        sub_f, _ = mgr_fail.submit_translation_batch(
+            job_f.job_id, bf.batch_id, [{"id": 1, "translation": "失败页"}], return_next=True
+        )
+        assert sub_f.done is True
+        assert internal_f._batches[bf.batch_id].status == "FAILED"
+        assert internal_f.pages[0].ctx is None
+        status_f = mgr_fail.get_job_status(job_f.job_id)
+        assert isinstance(status_f["failed_details"][0]["page_index"], int)
+        assert status_f["failed_details"][0]["page_index"] == 0
+    finally:
+        mgr_fail.shutdown()
+
+    # 3) Archive temp cleanup when create_translation_job fails after expansion
+    cleaned_archives = []
+    monkeypatch.setattr(
+        archive_extractor_module,
+        "cleanup_archive_temp",
+        lambda path: cleaned_archives.append(path),
+    )
+
+    def _bad_factory(_params):
+        raise RuntimeError("translator init failed")
+
+    mgr_arch = McpJobManager(
+        root_dir=str(_bootstrap.ROOT),
+        get_config=lambda: cfg_fail,
+        file_expander=lambda *a: ([p1], {p1: None}, {"fake.zip": str(tmp_path / "fake_ext")}),
+        translator_factory=_bad_factory,
+    )
+    try:
+        with pytest.raises(RuntimeError, match="translator init failed"):
+            mgr_arch.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        assert cleaned_archives == ["fake.zip"]
+    finally:
+        mgr_arch.shutdown()
+
+    # 4) McpService.cancel_active_job_async cancels on background thread & emits job_cancel_finished
+    from PyQt6.QtCore import Qt
+
+    svc = McpService(root_dir=str(_bootstrap.ROOT), config_service=SimpleNamespace(get_config=lambda: cfg_fail))
+    svc.job_manager._translator_factory = factory
+    cancel_done = threading.Event()
+    cancel_results = []
+    svc.job_cancel_finished.connect(
+        lambda ok, err: (
+            cancel_results.append((ok, err, threading.current_thread().name)),
+            cancel_done.set(),
+        ),
+        type=Qt.ConnectionType.DirectConnection,
+    )
+    try:
+        j_async = svc.job_manager.create_translation_job(inputs=[p1], output_dir=str(out_dir))
+        assert svc.has_active_job() is True
+        svc.cancel_active_job_async()
+        assert cancel_done.wait(timeout=5.0)
+        assert cancel_results == [(True, "", "mcp-cancel-job")]
+        assert svc.has_active_job() is False
+        assert svc.job_manager.get_job_status(j_async.job_id)["status"] == "cancelled"
+    finally:
+        svc.shutdown()
+
+
+

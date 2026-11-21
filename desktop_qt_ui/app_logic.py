@@ -46,7 +46,6 @@ from manga_translator.utils.system_proxy import (
 from PIL import Image
 from PyQt6.QtCore import (
     QCoreApplication,
-    QMetaObject,
     QObject,
     QRunnable,
     Qt,

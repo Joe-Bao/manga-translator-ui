@@ -404,10 +404,11 @@ class McpTranslationJob:
         self._render_thread: Optional[threading.Thread] = None
         self._finalize_wait_timeout: float = 120.0
         self._finalized = False
+        self._finished_callback_dispatched = False
 
         if not self.pages:
             with self._cond:
-                self._finalize_job_locked()
+                self._finalize_job_locked(defer_callback=True)
 
     def start(self) -> None:
         if not self.pages:
@@ -459,6 +460,17 @@ class McpTranslationJob:
             except OSError:
                 pass
         batch.preview_files.clear()
+
+    def _update_batch_terminal_status_locked(self, batch: McpBatchState) -> bool:
+        if not all(self.pages[i].rendered or self.pages[i].failed for i in batch.page_indices):
+            return False
+        batch.status = (
+            "FAILED"
+            if all(self.pages[i].failed for i in batch.page_indices)
+            else "DONE"
+        )
+        self._delete_batch_preview_files(batch)
+        return True
 
     def _reclaim_expired_leases_locked(self) -> None:
         now = time.monotonic()
@@ -522,7 +534,7 @@ class McpTranslationJob:
             return False
         return all(p.rendered or p.failed for p in self.pages)
 
-    def _finalize_job_locked(self) -> None:
+    def _finalize_job_locked(self, *, defer_callback: bool = False) -> None:
         if self._finalized:
             return
         self._finalized = True
@@ -549,7 +561,11 @@ class McpTranslationJob:
         self._finished_event.set()
         self._cond.notify_all()
 
-        callback = self._on_finished
+        callback = None
+        if not defer_callback and self._on_finished is not None and not self._finished_callback_dispatched:
+            self._finished_callback_dispatched = True
+            callback = self._on_finished
+
         if pool is not None or callback is not None:
             def _finish_cleanup() -> None:
                 if pool is not None:
@@ -565,6 +581,16 @@ class McpTranslationJob:
                 name=f"mcp-finish-{self.job_id[:6]}",
                 daemon=True,
             ).start()
+
+    def dispatch_finished_callback(self) -> None:
+        callback = None
+        with self._cond:
+            if not self._finalized or self._finished_callback_dispatched:
+                return
+            self._finished_callback_dispatched = True
+            callback = self._on_finished
+        if callback is not None:
+            callback(self)
 
     def _all_batches_committed_or_done_locked(self) -> bool:
         if not self._preprocessing_done or self._building_batch_pages:
@@ -740,25 +766,6 @@ class McpTranslationJob:
                         if self._check_all_done_locked():
                             self._finalize_job_locked()
                             break
-                        if (
-                            self._preprocessing_done
-                            and not self._building_batch_pages
-                            and not any(
-                                (p.pending_redo or (p.committed and not p.inpaint_done and not p.is_textless))
-                                and not p.failed
-                                for p in self.pages
-                            )
-                            and not (
-                                self.batch_concurrent
-                                and any(
-                                    b.status == "LEASED"
-                                    and any(not self.pages[i].inpaint_done and not self.pages[i].failed for i in b.page_indices)
-                                    for b in self._batches.values()
-                                )
-                            )
-                        ):
-                            # Nothing left for GPU worker unless a batch gets committed or redo added; wait.
-                            pass
                         self._cond.wait(timeout=0.25)
                         continue
 
@@ -884,13 +891,7 @@ class McpTranslationJob:
                                 page.ctx = None
                             if page.committed and page.batch_id and page.batch_id in self._batches:
                                 batch = self._batches[page.batch_id]
-                                if all(self.pages[i].rendered or self.pages[i].failed for i in batch.page_indices):
-                                    batch.status = (
-                                        "FAILED"
-                                        if all(self.pages[i].failed for i in batch.page_indices)
-                                        else "DONE"
-                                    )
-                                    self._delete_batch_preview_files(batch)
+                                self._update_batch_terminal_status_locked(batch)
                                 if self._check_all_done_locked():
                                     self._finalize_job_locked()
                             self._cond.notify_all()
@@ -933,6 +934,7 @@ class McpTranslationJob:
                     )
                     with self._cond:
                         page.rendered = True
+                        page.ctx = None
                         page.output_path = res.get("output_path")
                         page.skipped = bool(res.get("skipped"))
                         page.skip_reason = res.get("skip_reason")
@@ -946,10 +948,7 @@ class McpTranslationJob:
                             )
                         self._inflight_page_indices.discard(p_idx)
                         if page.batch_id and page.batch_id in self._batches:
-                            batch = self._batches[page.batch_id]
-                            if all(self.pages[i].rendered or self.pages[i].failed for i in batch.page_indices):
-                                batch.status = "DONE"
-                                self._delete_batch_preview_files(batch)
+                            self._update_batch_terminal_status_locked(self._batches[page.batch_id])
                         if self._check_all_done_locked():
                             self._finalize_job_locked()
                         self._cond.notify_all()
@@ -967,10 +966,7 @@ class McpTranslationJob:
                                 pass
                             page.ctx = None
                         if page.batch_id and page.batch_id in self._batches:
-                            batch = self._batches[page.batch_id]
-                            if all(self.pages[i].rendered or self.pages[i].failed for i in batch.page_indices):
-                                batch.status = "FAILED"
-                                self._delete_batch_preview_files(batch)
+                            self._update_batch_terminal_status_locked(self._batches[page.batch_id])
                         if self._check_all_done_locked():
                             self._finalize_job_locked()
                         self._cond.notify_all()
@@ -1021,17 +1017,20 @@ class McpTranslationJob:
 
         def _terminal_done_payload() -> BatchPayload:
             # Caller must hold self._cond; the job has already terminated.
+            summary = self._build_completion_summary_locked()
+            if self.cancel_event.is_set() and summary.get("status") == "running":
+                summary["status"] = "cancelled"
             return BatchPayload(
                 done=True,
                 job_id=self.job_id,
                 progress=self._progress_summary_locked(),
-                summary=self._build_completion_summary_locked(),
+                summary=summary,
             )
 
         selected_batch: Optional[McpBatchState] = None
         while True:
             with self._cond:
-                if self.cancel_event.is_set():
+                if self.cancel_event.is_set() or self._finalized:
                     return (
                         _terminal_done_payload(),
                         [],
@@ -1187,6 +1186,15 @@ class McpTranslationJob:
 
         with self._cond:
             if self.cancel_event.is_set() or self._finalized:
+                for info in delivery_map.values():
+                    fp = info.get("file_path")
+                    if fp and os.path.exists(fp):
+                        try:
+                            os.remove(fp)
+                        except OSError:
+                            pass
+                if self.preview_dir and os.path.isdir(self.preview_dir):
+                    shutil.rmtree(self.preview_dir, ignore_errors=True)
                 return _terminal_done_payload(), []
 
             for info in delivery_map.values():
@@ -1277,13 +1285,24 @@ class McpTranslationJob:
             )
 
         with self._cond:
+            if self.cancel_event.is_set() or self._finalized:
+                status_label = "cancelled" if self.cancel_event.is_set() else self.status
+                raise RuntimeError(
+                    f"Job '{self.job_id}' is already {status_label} and its preview buffers have been released."
+                )
             if page_index < 0 or page_index >= len(self.pages):
                 raise ValueError(f"Invalid page_index={page_index}; valid range is 0..{len(self.pages) - 1}")
             page = self.pages[page_index]
+            if page.failed:
+                raise RuntimeError(
+                    f"Page {page_index} has failed ({page.error or 'unknown error'}) and cannot be previewed."
+                )
+            if page.committed or page.render_queued or page.rendered:
+                raise RuntimeError(
+                    f"Page {page_index} has already been committed/rendered and its preview buffers are no longer available."
+                )
             if not page.preprocessed or page.ctx is None:
                 raise RuntimeError(f"Page {page_index} has not been preprocessed yet")
-            if page.rendered:
-                raise RuntimeError(f"Page {page_index} has already been rendered and its buffers released")
 
             self.on_demand_image_requests += 1
             lease_renewed = False
@@ -1325,13 +1344,24 @@ class McpTranslationJob:
             self.image_delivery == "auto" and len(raw_bytes) > budget_bytes
         )
 
-        self._emit_progress()
-
         if use_file_path:
             file_path = write_preview_bytes_to_disk(raw_bytes, self.preview_dir, stem, self.preview_format)
             with self._cond:
+                if self.cancel_event.is_set() or self._finalized:
+                    try:
+                        if file_path and os.path.exists(file_path):
+                            os.remove(file_path)
+                    except OSError:
+                        pass
+                    if self.preview_dir and os.path.isdir(self.preview_dir):
+                        shutil.rmtree(self.preview_dir, ignore_errors=True)
+                    status_label = "cancelled" if self.cancel_event.is_set() else self.status
+                    raise RuntimeError(
+                        f"Job '{self.job_id}' is already {status_label} and its preview buffers have been released."
+                    )
                 if batch_id in self._batches:
                     self._batches[batch_id].preview_files.append(file_path)
+            self._emit_progress()
             return (
                 PagePreviewResponse(
                     job_id=self.job_id,
@@ -1350,6 +1380,13 @@ class McpTranslationJob:
                 None,
             )
 
+        with self._cond:
+            if self.cancel_event.is_set() or self._finalized:
+                status_label = "cancelled" if self.cancel_event.is_set() else self.status
+                raise RuntimeError(
+                    f"Job '{self.job_id}' is already {status_label} and its preview buffers have been released."
+                )
+        self._emit_progress()
         return (
             PagePreviewResponse(
                 job_id=self.job_id,
@@ -1376,7 +1413,25 @@ class McpTranslationJob:
         new_terms: Optional[List[Dict[str, Any]]] = None,
         return_next: bool = True,
     ) -> Tuple[SubmitBatchResponse, List[Tuple[bytes, str]]]:
+        def _terminal_submit_response_locked() -> Tuple[SubmitBatchResponse, List[Tuple[bytes, str]]]:
+            status_label = "cancelled" if self.cancel_event.is_set() else self.status
+            summary = self._build_completion_summary_locked()
+            summary["status"] = status_label
+            return (
+                SubmitBatchResponse(
+                    status="error",
+                    job_id=self.job_id,
+                    batch_id=batch_id,
+                    done=True,
+                    summary=summary,
+                    message=f"Job '{self.job_id}' is already {status_label}.",
+                ),
+                [],
+            )
+
         with self._cond:
+            if self.cancel_event.is_set() or self._finalized:
+                return _terminal_submit_response_locked()
             batch = self._batches.get(batch_id)
             if batch is None:
                 return (
@@ -1430,11 +1485,15 @@ class McpTranslationJob:
 
         try:
             with self._cond:
+                if self.cancel_event.is_set() or self._finalized:
+                    return _terminal_submit_response_locked()
                 # Wait briefly if speculative P2 inpaint is currently active on any page in this batch.
                 while any(self.pages[i].inpaint_in_progress for i in batch.page_indices):
-                    if self.cancel_event.is_set():
-                        raise RuntimeError("Job cancelled while submitting batch")
+                    if self.cancel_event.is_set() or self._finalized:
+                        return _terminal_submit_response_locked()
                     self._cond.wait(timeout=0.1)
+                if self.cancel_event.is_set() or self._finalized:
+                    return _terminal_submit_response_locked()
 
             is_valid, errors, cleaned_map = _run_coro_sync(
                 validate_batch_translations(
@@ -1447,6 +1506,8 @@ class McpTranslationJob:
             )
             if not is_valid:
                 with self._cond:
+                    if self.cancel_event.is_set() or self._finalized:
+                        return _terminal_submit_response_locked()
                     batch.retry_count += 1
                     if batch.status == "LEASED":
                         batch.leased_at = time.monotonic()
@@ -1461,6 +1522,10 @@ class McpTranslationJob:
                     [],
                 )
 
+            with self._cond:
+                if self.cancel_event.is_set() or self._finalized:
+                    return _terminal_submit_response_locked()
+
             redo_pages, glossary_modified = _run_coro_sync(
                 apply_batch_post_processing(
                     self.translator,
@@ -1469,11 +1534,14 @@ class McpTranslationJob:
                     cleaned_map,
                     new_terms=new_terms,
                     prompt_file_path=self.prompt_file_path,
+                    cancel_event=self.cancel_event,
                 )
             )
             redo_set = set(redo_pages)
 
             with self._cond:
+                if self.cancel_event.is_set() or self._finalized:
+                    return _terminal_submit_response_locked()
                 for page in pages_in_batch:
                     page.committed = True
                     page.preview_cache = None  # Free preview bytes immediately after commit.
@@ -1509,13 +1577,7 @@ class McpTranslationJob:
 
                 batch.status = "COMMITTED"
                 batch.leased_at = None
-                if all(self.pages[i].rendered or self.pages[i].failed for i in batch.page_indices):
-                    batch.status = (
-                        "FAILED"
-                        if all(self.pages[i].failed for i in batch.page_indices)
-                        else "DONE"
-                    )
-                    self._delete_batch_preview_files(batch)
+                if self._update_batch_terminal_status_locked(batch):
                     if self._check_all_done_locked():
                         self._finalize_job_locked()
                 self._cond.notify_all()
@@ -1566,9 +1628,24 @@ class McpTranslationJob:
 
     def release_batch(self, batch_id: str) -> Dict[str, Any]:
         with self._cond:
+            if self.cancel_event.is_set() or self._finalized:
+                status_label = "cancelled" if self.cancel_event.is_set() else self.status
+                return {
+                    "released": False,
+                    "batch_id": batch_id,
+                    "status": status_label,
+                    "message": f"Job '{self.job_id}' is already {status_label}.",
+                }
             batch = self._batches.get(batch_id)
             if batch is None:
                 raise ValueError(f"Unknown batch_id '{batch_id}'")
+            if batch.submitting:
+                return {
+                    "released": False,
+                    "batch_id": batch_id,
+                    "status": batch.status,
+                    "message": f"Batch '{batch_id}' is currently being submitted and cannot be released.",
+                }
             if batch.status != "LEASED":
                 return {
                     "released": False,
@@ -1604,7 +1681,7 @@ class McpTranslationJob:
             redo_count = sum(1 for p in self.pages if p.pending_redo)
             render_q = len(self._render_queue)
             failed_details = [
-                {"page_index": str(p.page_index), "filename": p.filename, "error": p.error or ""}
+                {"page_index": p.page_index, "filename": p.filename, "error": p.error or ""}
                 for p in self.pages
                 if p.failed
             ]
@@ -1643,6 +1720,15 @@ class McpTranslationJob:
         if self._render_thread and self._render_thread.is_alive():
             self._render_thread.join(timeout=join_timeout)
         with self._cond:
+            deadline = time.monotonic() + max(0.0, float(join_timeout))
+            while any(b.submitting for b in self._batches.values()):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning(
+                        f"[MCP] Timed out waiting for in-flight batch submission before finalizing job {self.job_id}"
+                    )
+                    break
+                self._cond.wait(timeout=min(remaining, 0.1))
             # _finalize_job_locked() already cleans up ctx, preview buffers, and wake events.
             self._finalize_job_locked()
         self._emit_progress()
@@ -1738,6 +1824,12 @@ class McpJobManager:
             self._active_job_id = None
             return False
 
+    def should_update_ui_for_job(self, job_id: Optional[str]) -> bool:
+        with self._lock:
+            if not self._creating_job and self._active_job_id is None:
+                return True
+            return job_id is not None and job_id == self._active_job_id
+
     def _get_job(self, job_id: Optional[str] = None) -> McpTranslationJob:
         with self._lock:
             target_id = job_id or self._active_job_id or self._latest_job_id
@@ -1749,11 +1841,11 @@ class McpJobManager:
         with self._lock:
             if self._active_job_id == job.job_id:
                 self._active_job_id = None
-            if not self._creating_job and self._active_job_id is None:
-                self._schedule_idle_cleanup_locked()
+            was_tracked = self._jobs.pop(job.job_id, None) is not None
             status_snapshot = job.get_status_dict()
             self._record_completed_summary_locked(job.job_id, status_snapshot)
-            self._jobs.pop(job.job_id, None)
+            if (was_tracked or not job.pages) and not self._creating_job and self._active_job_id is None:
+                self._schedule_idle_cleanup_locked()
             summary = dict(status_snapshot)
             summary["completed_output_sources"] = dict(job.completed_output_sources)
 
@@ -1855,6 +1947,9 @@ class McpJobManager:
             self._creating_job = True
             self._cancel_idle_timer_locked()
 
+        creating_guard_active = True
+        archive_to_temp_map: Dict[str, str] = {}
+        job_handed_off = False
         try:
             cfg = self._get_config()
             cfg_dict = cfg.model_dump() if hasattr(cfg, "model_dump") else dict(cfg or {})
@@ -1903,12 +1998,17 @@ class McpJobManager:
             if not raw_sources:
                 raise ValueError("No input files provided and GUI file list is empty.")
 
+            explicit_output_dir = output_dir is not None and bool(str(output_dir).strip())
             resolved_output_dir = str(
                 output_dir
-                if output_dir is not None and str(output_dir).strip()
+                if explicit_output_dir
                 else (gui_snap.get("output_dir") or (cfg_dict.get("app") or {}).get("last_output_path") or "")
             ).strip()
-            save_to_source_dir = bool((cfg_dict.get("cli") or {}).get("save_to_source_dir", False))
+            save_to_source_dir = (
+                False
+                if explicit_output_dir
+                else bool((cfg_dict.get("cli") or {}).get("save_to_source_dir", False))
+            )
             if not save_to_source_dir:
                 if not resolved_output_dir:
                     raise ValueError("Output directory is empty. Provide output_dir or set Output Directory in GUI.")
@@ -1923,6 +2023,7 @@ class McpJobManager:
                 batch_size=batch_size,
                 context_size=context_size,
             )
+            engine_config.cli.save_to_source_dir = save_to_source_dir
 
             overwrite_flag = bool(engine_config.cli.overwrite)
             if self._file_expander is not None:
@@ -1963,6 +2064,10 @@ class McpJobManager:
             }
 
             translator = self._translator_factory(translator_params)
+            if getattr(translator, "filter_text_enabled", False):
+                from manga_translator.utils.text_filter import load_filter_list
+
+                load_filter_list(force_reload=True)
             guidelines, glossary, resolved_prompt_path = _run_coro_sync(
                 load_job_guidelines_and_glossary(translator, engine_config, self.root_dir)
             )
@@ -1993,6 +2098,7 @@ class McpJobManager:
                 on_progress=self._on_progress,
                 on_finished=self._handle_job_finished,
             )
+            job_handed_off = True
 
             with self._lock:
                 self._latest_job_id = job_id
@@ -2002,12 +2108,29 @@ class McpJobManager:
                 else:
                     self._record_completed_summary_locked(job_id, job.get_status_dict())
                 self._creating_job = False
+                creating_guard_active = False
+        except Exception:
+            if not job_handed_off and archive_to_temp_map:
+                try:
+                    from desktop_qt_ui.utils.archive_extractor import cleanup_archive_temp
 
-            if job.pages:
-                job.start()
+                    for archive_path in list(archive_to_temp_map):
+                        try:
+                            cleanup_archive_temp(archive_path)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            raise
         finally:
-            with self._lock:
-                self._creating_job = False
+            if creating_guard_active:
+                with self._lock:
+                    self._creating_job = False
+
+        if job.pages:
+            job.start()
+        else:
+            job.dispatch_finished_callback()
 
         return CreateJobResponse(
             job_id=job_id,
@@ -2087,7 +2210,19 @@ class McpJobManager:
         region_ids: Optional[List[int]] = None,
         high_res: bool = False,
     ) -> Tuple[PagePreviewResponse, Optional[bytes]]:
-        job = self._get_job(job_id)
+        with self._lock:
+            target_id = job_id or self._active_job_id or self._latest_job_id
+            if not target_id:
+                raise KeyError(f"Translation job not found: {job_id or '<active>'}")
+            job = self._jobs.get(target_id)
+            if job is None:
+                cached = self._completed_job_summaries.get(target_id)
+                if cached is not None:
+                    status_str = str(cached.get("status", "completed") or "completed")
+                    raise RuntimeError(
+                        f"Job '{target_id}' is already {status_str} and its preview buffers have been released."
+                    )
+                raise KeyError(f"Translation job not found: {job_id or '<active>'}")
         return job.get_page_preview(page_index, region_ids=region_ids, high_res=high_res)
 
     def submit_translation_batch(
@@ -2128,7 +2263,22 @@ class McpJobManager:
         )
 
     def release_batch(self, job_id: str, batch_id: str) -> Dict[str, Any]:
-        job = self._get_job(job_id)
+        with self._lock:
+            target_id = job_id or self._active_job_id or self._latest_job_id
+            if not target_id:
+                raise KeyError(f"Translation job not found: {job_id or '<active>'}")
+            job = self._jobs.get(target_id)
+            if job is None:
+                cached = self._completed_job_summaries.get(target_id)
+                if cached is not None:
+                    status_str = str(cached.get("status", "completed") or "completed")
+                    return {
+                        "released": False,
+                        "batch_id": batch_id,
+                        "status": status_str,
+                        "message": f"Job '{target_id}' is already {status_str}.",
+                    }
+                raise KeyError(f"Translation job not found: {job_id or '<active>'}")
         return job.release_batch(batch_id)
 
     def get_job_status(self, job_id: Optional[str] = None) -> Dict[str, Any]:
@@ -2159,9 +2309,10 @@ class McpJobManager:
         with self._lock:
             if self._active_job_id == job.job_id:
                 self._active_job_id = None
+            was_tracked = self._jobs.pop(job.job_id, None) is not None
             self._record_completed_summary_locked(job.job_id, status)
-            self._jobs.pop(job.job_id, None)
-            self._schedule_idle_cleanup_locked()
+            if was_tracked and not self._creating_job and self._active_job_id is None:
+                self._schedule_idle_cleanup_locked()
         return status
 
     def unload_models(self) -> Dict[str, Any]:
