@@ -374,7 +374,9 @@ class McpService(QObject):
         if self._shutdown_done:
             return
         try:
-            self.job_progress_changed.emit(summary)
+            active_id = self.job_manager._active_job_id
+            if not self.has_active_job() or active_id == summary.get("job_id"):
+                self.job_progress_changed.emit(summary)
             self.job_finished.emit(summary)
         except RuntimeError:
             pass

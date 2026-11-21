@@ -351,6 +351,7 @@ async def preprocess_page(
         else:
             ctx.mask_raw = mask_arr
 
+    translator._prepare_loaded_regions(loaded_regions, use_text_as_translation=False)
     for region in loaded_regions:
         region.translation = ""
         if hasattr(region, "translation_raw"):
@@ -359,6 +360,8 @@ async def preprocess_page(
             region.translation_rich = None
 
     ctx.text_regions = loaded_regions
+    ctx.skip_font_scaling = bool(_skip_scale)
+    translator._apply_pre_dictionary_to_regions(ctx)
     ctx._initial_region_ids = {id(r) for r in loaded_regions}
     return ctx
 
@@ -957,7 +960,14 @@ async def render_and_save_page(
         and getattr(ctx, "text_regions", None) is not None
         and image_name
     ):
-        translator._save_text_to_file(image_name, ctx, config)
+        parse_failures = int(getattr(ctx, "load_text_parse_failures", 0) or 0)
+        if parse_failures > 0:
+            logger.error(
+                f"{parse_failures} region(s) failed to parse for "
+                f"{os.path.basename(image_name)}; skipped JSON write-back to protect the project file"
+            )
+        else:
+            translator._save_text_to_file(image_name, ctx, config)
 
     result_payload = {
         "image_name": image_name,

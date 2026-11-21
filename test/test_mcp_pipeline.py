@@ -1528,3 +1528,220 @@ def test_next_translation_batch_cancel_wakeup_returns_done_without_fallback(tmp_
         allow_proceed.set()
         mgr.shutdown()
 
+
+def test_next_and_submit_translation_batch_on_completed_and_all_skipped_jobs(tmp_path):
+    """R3-1a & R3-1b: all-skipped and pruned completed jobs return done=True instead of KeyError."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # R3-1a: pending_pages == 0 (all pages skipped)
+    skipped_img = _make_png(tmp_path / "p1.png")
+    _make_png(out_dir / "p1.png")
+    cfg_skip = _base_config(str(out_dir))
+    cfg_skip["cli"]["overwrite"] = False
+    factory_skip, _ = _make_stub_factory({"p1.png": [_make_block("跳过")]})
+
+    mgr_skip = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg_skip, translator_factory=factory_skip)
+    try:
+        job_skip = mgr_skip.create_translation_job(inputs=[skipped_img], output_dir=str(out_dir))
+        assert job_skip.pending_pages == 0
+        assert job_skip.skipped_pages == 1
+
+        payload, inline = mgr_skip.next_translation_batch(job_skip.job_id)
+        assert payload.done is True
+        assert payload.job_id == job_skip.job_id
+        assert payload.progress.skipped_pages == 1
+        assert payload.summary is not None
+        assert payload.summary["skipped_pages"] == 1
+        assert inline == []
+
+        sub_err, sub_inline = mgr_skip.submit_translation_batch(job_skip.job_id, "batch_0001", [])
+        assert sub_err.status == "error"
+        assert sub_err.done is True
+        assert sub_inline == []
+    finally:
+        mgr_skip.shutdown()
+
+    # R3-1b: completed job pruned from _jobs into _completed_job_summaries
+    done_img = _make_png(tmp_path / "p2.png")
+    cfg_done = _base_config(str(out_dir))
+    factory_done, _ = _make_stub_factory({"p2.png": [_make_block("完成")]})
+
+    mgr_done = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg_done, translator_factory=factory_done)
+    try:
+        job_done = mgr_done.create_translation_job(inputs=[done_img], output_dir=str(out_dir))
+        batch, _ = mgr_done.next_translation_batch(job_done.job_id)
+        sub, _ = mgr_done.submit_translation_batch(
+            job_done.job_id,
+            batch.batch_id,
+            [{"id": 1, "translation": "已完成译文"}],
+            return_next=True,
+        )
+        assert sub.done is True
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and job_done.job_id in mgr_done._jobs:
+            time.sleep(0.02)
+        assert job_done.job_id not in mgr_done._jobs
+
+        payload_after, inline_after = mgr_done.next_translation_batch(job_done.job_id)
+        assert payload_after.done is True
+        assert payload_after.summary is not None
+        assert payload_after.summary["rendered_pages"] == 1
+        assert inline_after == []
+
+        sub_after, sub_after_inline = mgr_done.submit_translation_batch(
+            job_done.job_id,
+            batch.batch_id,
+            [{"id": 1, "translation": "重试"}],
+        )
+        assert sub_after.status == "error"
+        assert sub_after.done is True
+        assert sub_after_inline == []
+    finally:
+        mgr_done.shutdown()
+
+
+def test_segment_end_textless_page_seals_building_batch_across_skipped_gap(tmp_path):
+    """R3-2: a textless page at segment end must seal the preceding building batch across skipped gaps."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    p1 = _make_png(tmp_path / "01.png")
+    p2 = _make_png(tmp_path / "02.png")
+    p3 = _make_png(tmp_path / "03.png")
+    p4 = _make_png(tmp_path / "04.png")
+    _make_png(out_dir / "03.png")  # pre-existing output -> skipped
+    p3_json = Path(get_json_path(p3, create_dir=True))
+    p3_json.write_text(
+        json.dumps(
+            {
+                os.path.abspath(p3): {
+                    "regions": [
+                        {
+                            "lines": [[[10, 10], [80, 10], [80, 30], [10, 30]]],
+                            "texts": ["三页跳过"],
+                            "text": "三页跳过",
+                            "translation": "已有第三页译文",
+                            "prob": 0.9,
+                        }
+                    ],
+                    "original_width": 240,
+                    "original_height": 320,
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    factory, _ = _make_stub_factory(
+        {
+            "01.png": [_make_block("一页")],
+            "02.png": [],
+            "04.png": [_make_block("四页")],
+        }
+    )
+    cfg = _base_config(str(out_dir))
+    cfg["cli"]["overwrite"] = False
+    cfg["cli"]["batch_size"] = 3
+
+    mgr = McpJobManager(root_dir=str(_bootstrap.ROOT), get_config=lambda: cfg, translator_factory=factory)
+    try:
+        job = mgr.create_translation_job(inputs=[p1, p2, p3, p4], output_dir=str(out_dir))
+        assert job.pending_pages == 3
+        assert job.skipped_pages == 1
+        internal_job = mgr._jobs[job.job_id]
+        assert internal_job._segments == [[0, 1], [2]]
+
+        b1, _ = mgr.next_translation_batch(job.job_id)
+        assert [p.filename for p in b1.pages] == ["01.png"]
+
+        sub1, _ = mgr.submit_translation_batch(
+            job.job_id,
+            b1.batch_id,
+            [{"id": 1, "translation": "第一页"}],
+            return_next=True,
+        )
+        b2 = sub1.next_batch
+        assert b2 is not None and not b2.done
+        assert [p.filename for p in b2.pages] == ["04.png"]
+
+        done_resp, _ = mgr.submit_translation_batch(
+            job.job_id,
+            b2.batch_id,
+            [{"id": 1, "translation": "第四页"}],
+            return_next=True,
+        )
+        assert done_resp.done is True
+        assert done_resp.summary["rendered_pages"] == 3
+        assert done_resp.summary["textless_pages"] == 1
+    finally:
+        mgr.shutdown()
+
+
+def test_retranslate_json_applies_pre_dict_and_protects_corrupt_regions_on_save(tmp_path):
+    """R3-3: retranslate_json applies pre_dict, fills font_size, and blocks JSON write-back on parse failures."""
+    import asyncio
+    from manga_translator.mcp.batch_adapter import preprocess_page, render_and_save_page
+
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img_path = _make_png(tmp_path / "p1.png")
+
+    pre_dict_path = tmp_path / "pre_dict.txt"
+    pre_dict_path.write_text("原文A 预替换A\n", encoding="utf-8")
+
+    json_path = Path(get_json_path(img_path, create_dir=True))
+    original_json_obj = {
+        os.path.abspath(img_path): {
+            "regions": [
+                {
+                    "lines": [[[10, 10], [80, 10], [80, 30], [10, 30]]],
+                    "texts": ["原文A"],
+                    "text": "原文A",
+                    "translation": "旧译文",
+                    "font_size": 0,
+                    "prob": 0.9,
+                },
+                {
+                    "lines": "invalid_not_a_list",
+                    "texts": ["损坏区域"],
+                    "text": "损坏区域",
+                },
+            ],
+            "original_width": 240,
+            "original_height": 320,
+        }
+    }
+    original_json_text = json.dumps(original_json_obj, ensure_ascii=False, indent=2)
+    json_path.write_text(original_json_text, encoding="utf-8")
+
+    cfg = _base_config(str(out_dir))
+    cfg["cli"]["pre_dict"] = str(pre_dict_path)
+    cfg["cli"]["save_text"] = True
+    engine_config, translator_params = build_mcp_engine_config(cfg, str(_bootstrap.ROOT))
+    factory, _ = _make_stub_factory({"p1.png": [_make_block("原文A")]})
+    translator = factory(translator_params)
+    translator.save_text = True
+
+    ctx = asyncio.run(preprocess_page(translator, img_path, engine_config, retranslate_json=True))
+    assert len(ctx.text_regions) == 1
+    assert ctx.text_regions[0].text == "预替换A"
+    assert ctx.text_regions[0].translation == ""
+    assert ctx.text_regions[0].font_size > 0
+    assert ctx.load_text_parse_failures == 1
+
+    ctx.text_regions[0].translation = "新译文"
+    ctx.img_inpainted = ctx.img_rgb.copy()
+    save_info = {
+        "output_folder": str(out_dir),
+        "format": "png",
+        "overwrite": True,
+        "input_folders": set(),
+        "save_to_source_dir": False,
+    }
+    res = asyncio.run(render_and_save_page(translator, engine_config, ctx, save_info))
+    assert res["success"] is True
+    assert json_path.read_text(encoding="utf-8") == original_json_text
+
+

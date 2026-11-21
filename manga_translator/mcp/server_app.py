@@ -74,6 +74,7 @@ def create_fastmcp_server(
                 "http://[::1]:*",
                 "https://127.0.0.1:*",
                 "https://localhost:*",
+                "https://[::1]:*",
             ],
         ),
     )

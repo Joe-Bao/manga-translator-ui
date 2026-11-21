@@ -799,6 +799,7 @@ class McpTranslationJob:
                                 page.error = str(ctx.translation_error)
                                 self._inflight_page_indices.discard(p_idx)
                                 self.translator._cleanup_context_memory(ctx, keep_result=False)
+                                page.ctx = None
                             elif not getattr(ctx, "text_regions", None):
                                 page.is_textless = True
                                 page.committed = True
@@ -807,12 +808,13 @@ class McpTranslationJob:
                                 self._render_queue.append(p_idx)
                             else:
                                 self._building_batch_pages.append(p_idx)
-                                if (
-                                    len(self._building_batch_pages) >= self.batch_size
-                                    or at_segment_end
-                                    or len(self._inflight_page_indices) >= self.max_inflight_pages
-                                ):
-                                    self._seal_building_batch_locked()
+
+                            if self._building_batch_pages and (
+                                len(self._building_batch_pages) >= self.batch_size
+                                or at_segment_end
+                                or len(self._inflight_page_indices) >= self.max_inflight_pages
+                            ):
+                                self._seal_building_batch_locked()
 
                             if not self._has_next_unpreprocessed_locked():
                                 self._preprocessing_done = True
@@ -830,6 +832,7 @@ class McpTranslationJob:
                                     self.translator._cleanup_context_memory(page.ctx, keep_result=False)
                                 except Exception:
                                     pass
+                                page.ctx = None
                             if at_segment_end:
                                 self._seal_building_batch_locked()
                             if not self._has_next_unpreprocessed_locked():
@@ -962,6 +965,7 @@ class McpTranslationJob:
                                 self.translator._cleanup_context_memory(page.ctx, keep_result=False)
                             except Exception:
                                 pass
+                            page.ctx = None
                         if page.batch_id and page.batch_id in self._batches:
                             batch = self._batches[page.batch_id]
                             if all(self.pages[i].rendered or self.pages[i].failed for i in batch.page_indices):
@@ -1638,8 +1642,6 @@ class McpTranslationJob:
             self._gpu_thread.join(timeout=join_timeout)
         if self._render_thread and self._render_thread.is_alive():
             self._render_thread.join(timeout=join_timeout)
-        if self._preview_pool is not None:
-            self._preview_pool.shutdown(wait=False, cancel_futures=True)
         with self._cond:
             # _finalize_job_locked() already cleans up ctx, preview buffers, and wake events.
             self._finalize_job_locked()
@@ -1747,7 +1749,8 @@ class McpJobManager:
         with self._lock:
             if self._active_job_id == job.job_id:
                 self._active_job_id = None
-            self._schedule_idle_cleanup_locked()
+            if not self._creating_job and self._active_job_id is None:
+                self._schedule_idle_cleanup_locked()
             status_snapshot = job.get_status_dict()
             self._record_completed_summary_locked(job.job_id, status_snapshot)
             self._jobs.pop(job.job_id, None)
@@ -2026,12 +2029,54 @@ class McpJobManager:
             output_dir=resolved_output_dir,
         )
 
+    def _build_done_payload_from_summary_locked(
+        self,
+        job_id: str,
+        cached: Dict[str, Any],
+    ) -> BatchPayload:
+        progress = JobProgressSummary(
+            total_pages=int(cached.get("total_pages", 0) or 0),
+            pending_pages=int(cached.get("pending_pages", 0) or 0),
+            skipped_pages=int(cached.get("skipped_pages", 0) or 0),
+            preprocessed_pages=int(cached.get("preprocessed_pages", 0) or 0),
+            committed_pages=int(cached.get("committed_pages", 0) or 0),
+            rendered_pages=int(cached.get("rendered_pages", 0) or 0),
+            failed_pages=int(cached.get("failed_pages", 0) or 0),
+            textless_pages=int(cached.get("textless_pages", 0) or 0),
+            on_demand_image_requests=int(cached.get("on_demand_image_requests", 0) or 0),
+        )
+        summary = progress.model_dump()
+        summary.update(
+            {
+                "job_id": job_id,
+                "status": cached.get("status", "completed"),
+                "output_dir": cached.get("output_dir", ""),
+                "output_paths": list(cached.get("output_paths") or []),
+                "failed_details": list(cached.get("failed_details") or []),
+            }
+        )
+        return BatchPayload(
+            done=True,
+            job_id=job_id,
+            progress=progress,
+            summary=summary,
+        )
+
     def next_translation_batch(
         self,
         job_id: str,
         worker_id: Optional[str] = None,
     ) -> Tuple[BatchPayload, List[Tuple[bytes, str]]]:
-        job = self._get_job(job_id)
+        with self._lock:
+            target_id = job_id or self._active_job_id or self._latest_job_id
+            if not target_id:
+                raise KeyError(f"Translation job not found: {job_id or '<active>'}")
+            job = self._jobs.get(target_id)
+            if job is None:
+                cached = self._completed_job_summaries.get(target_id)
+                if cached is not None:
+                    return self._build_done_payload_from_summary_locked(target_id, cached), []
+                raise KeyError(f"Translation job not found: {job_id or '<active>'}")
         return job.next_translation_batch(worker_id=worker_id)
 
     def get_page_preview(
@@ -2054,7 +2099,27 @@ class McpJobManager:
         new_terms: Optional[List[Dict[str, Any]]] = None,
         return_next: bool = True,
     ) -> Tuple[SubmitBatchResponse, List[Tuple[bytes, str]]]:
-        job = self._get_job(job_id)
+        with self._lock:
+            target_id = job_id or self._active_job_id or self._latest_job_id
+            if not target_id:
+                raise KeyError(f"Translation job not found: {job_id or '<active>'}")
+            job = self._jobs.get(target_id)
+            if job is None:
+                cached = self._completed_job_summaries.get(target_id)
+                if cached is not None:
+                    status_str = str(cached.get("status", "completed") or "completed")
+                    return (
+                        SubmitBatchResponse(
+                            status="error",
+                            job_id=target_id,
+                            batch_id=batch_id,
+                            done=True,
+                            summary=dict(cached),
+                            message=f"Job '{target_id}' is already {status_str}.",
+                        ),
+                        [],
+                    )
+                raise KeyError(f"Translation job not found: {job_id or '<active>'}")
         return job.submit_translation_batch(
             batch_id,
             translations,

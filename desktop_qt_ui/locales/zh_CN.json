@@ -1596,7 +1596,7 @@
   "MCP Effective Mode Value": "有效模式: {mode}",
   "MCP On Demand Count Value": "按需看图次数: {count}",
   "MCP Job Idle": "当前无正在运行的 MCP 任务。",
-  "MCP Job Status Summary": "状态: {status} | 已预处理: {preprocessed} | 已提交: {committed} | 待渲染: {pending} | 已完成渲染: {rendered} | 已跳过: {skipped} | 失败: {failed}",
+  "MCP Job Status Summary": "状态: {status} | 已预处理: {preprocessed} | 已提交: {committed} | 待翻页: {pending} | 已完成渲染: {rendered} | 已跳过: {skipped} | 失败: {failed}",
   "MCP Stop Job": "停止当前任务",
   "MCP Open Output Dir": "打开输出目录",
   "MCP Unload Models": "手动卸载本地模型",
